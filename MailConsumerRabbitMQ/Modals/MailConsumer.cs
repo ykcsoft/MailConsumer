@@ -1,6 +1,5 @@
 ﻿using System.Collections.Concurrent;
 using System.Text;
-using MailConsumerRabbitMQ.Helper;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.AspNetCore.Http;
@@ -20,18 +19,15 @@ namespace MailConsumerRabbitMQ.Modals
 
         public int sayac = 1;
 
-        // SMTP session cache
+        // SMTP session cache: host + port + user
         private readonly ConcurrentDictionary<string, SmtpSession> _smtpSessions = new();
 
-        // Gmail throttle/circuit breaker
+        // SMTP temporary block/circuit breaker: host + port + user
         private readonly ConcurrentDictionary<string, DateTime> _smtpBlockedUntilUtc = new();
 
         // Queue names
         private const string Q_MAIN = "mail_queue";
-        private const string Q_RETRY_30M = "mail_retry_30m";
-        private const string Q_RETRY_1H = "mail_retry_1h";
-        private const string Q_RETRY_3H = "mail_retry_3h";
-        private const string Q_DEAD = "mail_dead";
+        private const string Q_RETRY_5M = "mail_retry_5m";
 
         public async Task InitializeAsync()
         {
@@ -43,20 +39,10 @@ namespace MailConsumerRabbitMQ.Modals
                 Password = "1234567",
             };
 
-            // Local test için istersen bunu aç:
-
-            //_factory = new ConnectionFactory
-            //{
-            //    Port = 5672,
-            //    HostName = "192.168.1.76",
-            //    UserName = "user",
-            //    Password = "1234567",
-            //};
-
-
             _connection = await _factory.CreateConnectionAsync();
             _channel = await _connection.CreateChannelAsync();
 
+            // MAIN QUEUE
             await _channel.QueueDeclareAsync(
                 queue: Q_MAIN,
                 durable: true,
@@ -64,50 +50,20 @@ namespace MailConsumerRabbitMQ.Modals
                 autoDelete: false,
                 arguments: null);
 
+            // RETRY QUEUE: 5 dakika bekler, sonra ana kuyruğa geri döner
             await _channel.QueueDeclareAsync(
-                queue: Q_DEAD,
-                durable: true,
-                exclusive: false,
-                autoDelete: false,
-                arguments: null);
-
-            await _channel.QueueDeclareAsync(
-                queue: Q_RETRY_30M,
+                queue: Q_RETRY_5M,
                 durable: true,
                 exclusive: false,
                 autoDelete: false,
                 arguments: new Dictionary<string, object>
                 {
-                    ["x-message-ttl"] = 1_800_000, // 30 dakika
+                    ["x-message-ttl"] = 300_000,
                     ["x-dead-letter-exchange"] = "",
                     ["x-dead-letter-routing-key"] = Q_MAIN
                 });
 
-            await _channel.QueueDeclareAsync(
-                queue: Q_RETRY_1H,
-                durable: true,
-                exclusive: false,
-                autoDelete: false,
-                arguments: new Dictionary<string, object>
-                {
-                    ["x-message-ttl"] = 3_600_000, // 1 saat
-                    ["x-dead-letter-exchange"] = "",
-                    ["x-dead-letter-routing-key"] = Q_MAIN
-                });
-
-            await _channel.QueueDeclareAsync(
-                queue: Q_RETRY_3H,
-                durable: true,
-                exclusive: false,
-                autoDelete: false,
-                arguments: new Dictionary<string, object>
-                {
-                    ["x-message-ttl"] = 10_800_000, // 3 saat
-                    ["x-dead-letter-exchange"] = "",
-                    ["x-dead-letter-routing-key"] = Q_MAIN
-                });
-
-            // Aynı consumer instance çok mesaj çekip Gmail'e abanmasın
+            // Aynı anda çok mail çekip SMTP hesabına abanmasın
             await _channel.BasicQosAsync(
                 prefetchSize: 0,
                 prefetchCount: 1,
@@ -136,9 +92,6 @@ namespace MailConsumerRabbitMQ.Modals
                     {
                         var mailMultiple = JsonConvert.DeserializeObject<MessageMQMailMultiple>(message);
 
-                        if (mailMultiple == null)
-                            throw new InvalidOperationException("MQ message parse edildi ama null döndü.");
-
                         if (mailMultiple == null || mailMultiple.MailMultiVM == null)
                             throw new InvalidOperationException("MQ message parse edildi ama MailVM / MailMultiVM bulunamadı.");
 
@@ -152,17 +105,13 @@ namespace MailConsumerRabbitMQ.Modals
                 {
                     var retryCount = ReadRetryCount(ea.BasicProperties?.Headers);
 
-                    if (HelperGmail.IsGmailAuthBlocked(ex) || IsCircuitBreakException(ex))
-                    {
-                        var targetQueue = retryCount switch
-                        {
-                            0 => Q_RETRY_30M,
-                            1 => Q_RETRY_1H,
-                            2 => Q_RETRY_3H,
-                            _ => Q_DEAD
-                        };
+                    Console.WriteLine(
+                        $"[MAIL-ERROR] retry={retryCount} err={ex.GetType().Name} msg={ex.Message}"
+                    );
 
-                        Console.WriteLine($"[Retry] retryCount={retryCount} targetQueue={targetQueue}");
+                    if (retryCount == 0)
+                    {
+                        Console.WriteLine("[MAIL-RETRY] İlk hata. Mesaj 5 dakika sonra tekrar denenecek.");
 
                         await PublishWithRetryHeaderAsync(
                             routingKey: Q_RETRY_5M,
@@ -170,17 +119,13 @@ namespace MailConsumerRabbitMQ.Modals
                             originalProps: ea.BasicProperties,
                             retryCount: 1);
 
+                        // Ana mesajı ACK'liyoruz ki anında tekrar tekrar dönmesin
                         await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                         return;
                     }
 
-                    Console.WriteLine("[Dead] Gmail auth dışı hata, mail_dead kuyruğuna atılıyor.");
-
-                    await PublishWithRetryHeaderAsync(
-                        routingKey: Q_DEAD,
-                        body: ea.Body,
-                        originalProps: ea.BasicProperties,
-                        retryCount: retryCount);
+                    // İkinci kez de başarısız olduysa sistemden çıkar
+                    Console.WriteLine("[MAIL-DROP] İkinci deneme de başarısız. Mesaj siliniyor, tekrar kuyruğa alınmayacak.");
 
                     await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                 }
@@ -194,6 +139,9 @@ namespace MailConsumerRabbitMQ.Modals
             Console.WriteLine("MailConsumer çalışıyor, mail kuyruğu dinleniyor...");
         }
 
+        // -------------------------
+        // SMTP session wrapper
+        // -------------------------
         private sealed class SmtpSession : IAsyncDisposable
         {
             public readonly SmtpClient Client = new();
@@ -212,10 +160,7 @@ namespace MailConsumerRabbitMQ.Modals
                 }
 
                 Client.Dispose();
-
-                // Gate dispose etmiyoruz.
-                // Çünkü hata anında finally içinde Release çalışırken ObjectDisposedException oluşturabiliyordu.
-                // Gate.Dispose();
+                Gate.Dispose();
             }
         }
 
@@ -224,24 +169,39 @@ namespace MailConsumerRabbitMQ.Modals
 
         private static SecureSocketOptions ResolveSocketOptions(string host, int port, bool sslFlag)
         {
-            if (port == 465) return SecureSocketOptions.SslOnConnect;
-            if (port == 587) return SecureSocketOptions.StartTls;
+            if (port == 465)
+                return SecureSocketOptions.SslOnConnect;
 
-            return externalSslFlag
+            if (port == 587)
+                return SecureSocketOptions.StartTls;
+
+            return sslFlag
                 ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTlsWhenAvailable;
         }
 
-        private static bool IsCircuitBreakException(Exception ex)
-            => ex is SmtpProtocolException sp &&
-               sp.Message.StartsWith("CircuitBreak:", StringComparison.OrdinalIgnoreCase);
+        private static bool IsGmailTooManyLogin(Exception ex)
+        {
+            var s = ex.ToString();
 
-        private Task<SmtpSession> GetOrCreateSessionAsync(string host, int port, string user)
+            return s.Contains("4.7.0", StringComparison.OrdinalIgnoreCase) &&
+                   (
+                       s.Contains("Too many login attempts", StringComparison.OrdinalIgnoreCase) ||
+                       s.Contains("Cannot authenticate due to a temporary system problem", StringComparison.OrdinalIgnoreCase) ||
+                       s.Contains("temporar", StringComparison.OrdinalIgnoreCase)
+                   );
+        }
+
+        private static bool IsCircuitBreakException(Exception ex)
+        {
+            return ex is SmtpProtocolException sp &&
+                   sp.Message.StartsWith("CircuitBreak:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<SmtpSession> GetOrCreateSessionAsync(string host, int port, string user)
         {
             var key = SessionKey(host, port, user);
-            var session = _smtpSessions.GetOrAdd(key, _ => new SmtpSession());
-
-            return Task.FromResult(session);
+            return _smtpSessions.GetOrAdd(key, _ => new SmtpSession());
         }
 
         private async Task EnsureConnectedAndAuthedAsync(
@@ -257,7 +217,7 @@ namespace MailConsumerRabbitMQ.Modals
                 session.Client.CheckCertificateRevocation = true;
                 session.Client.Timeout = 60_000;
 
-                // App Password kullanıyorsun, XOAUTH2 denemesin.
+                // App Password kullanıyorsan XOAUTH2 denemesin
                 session.Client.AuthenticationMechanisms.Remove("XOAUTH2");
 
                 var options = ResolveSocketOptions(host, port, ssl);
@@ -290,9 +250,6 @@ namespace MailConsumerRabbitMQ.Modals
 
             var session = await GetOrCreateSessionAsync(host, port, user);
 
-            var shouldDispose = false;
-            Exception? capturedException = null;
-
             await session.Gate.WaitAsync();
 
             try
@@ -302,41 +259,37 @@ namespace MailConsumerRabbitMQ.Modals
             }
             catch (Exception ex)
             {
-                capturedException = ex;
-
                 Console.WriteLine($"{logPrefix} err={ex.GetType().Name} msg={ex.Message}");
 
-                if (HelperGmail.IsGmailAuthBlocked(ex) || !session.Client.IsConnected)
+                if (IsGmailTooManyLogin(ex) || IsCircuitBreakException(ex) || !session.Client.IsConnected)
                 {
-                    Console.WriteLine($"[CircuitBreak-SET] smtpUser={user} host={host}:{port} blockedFor=1h");
-
-                    _smtpBlockedUntilUtc[key] = DateTime.UtcNow.AddHours(1);
+                    _smtpBlockedUntilUtc[key] = DateTime.UtcNow.AddMinutes(10);
 
                     _smtpSessions.TryRemove(key, out _);
-                    shouldDispose = true;
+
+                    try
+                    {
+                        await session.DisposeAsync();
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+
+                    Console.WriteLine($"[CircuitBreak-SET] smtpUser={user} host={host}:{port} blockedFor=10m");
                 }
+
+                throw;
             }
             finally
             {
                 session.Gate.Release();
             }
-
-            if (shouldDispose)
-            {
-                try
-                {
-                    await session.DisposeAsync();
-                }
-                catch
-                {
-                    // ignore
-                }
-            }
-
-            if (capturedException != null)
-                throw capturedException;
         }
 
+        // -------------------------
+        // RabbitMQ helpers
+        // -------------------------
         private static int ReadRetryCount(IDictionary<string, object>? headers)
         {
             if (headers == null)
@@ -353,9 +306,14 @@ namespace MailConsumerRabbitMQ.Modals
                     return int.TryParse(s, out var n) ? n : 0;
                 }
 
-                if (v is int i) return i;
-                if (v is long l) return (int)l;
-                if (v is string str) return int.TryParse(str, out var n) ? n : 0;
+                if (v is int i)
+                    return i;
+
+                if (v is long l)
+                    return (int)l;
+
+                if (v is string str)
+                    return int.TryParse(str, out var n) ? n : 0;
             }
             catch
             {
@@ -397,6 +355,104 @@ namespace MailConsumerRabbitMQ.Modals
                 body: body);
         }
 
+        // -------------------------
+        // Log helpers
+        // -------------------------
+        private static string MaskSecret(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            if (value.Length <= 6)
+                return "***";
+
+            return value.Substring(0, 3) + "***" + value.Substring(value.Length - 3);
+        }
+
+        private static string SafeLog(string? value, int max = 180)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            value = value
+                .Replace("\r", " ")
+                .Replace("\n", " ")
+                .Replace("\t", " ")
+                .Trim();
+
+            return value.Length > max
+                ? value.Substring(0, max) + "..."
+                : value;
+        }
+
+        private static void LogMailMq(string tag, MessageMQMail mail)
+        {
+            Console.WriteLine(
+                $"[{tag}] " +
+                $"mailId={mail.MailVM?.MailId} " +
+                $"to={SafeLog(mail.MailVM?.To)} " +
+                $"cc={SafeLog(mail.MailVM?.Cc)} " +
+                $"bcc={SafeLog(mail.MailVM?.Bcc)} " +
+                $"subject=\"{SafeLog(mail.MailVM?.Subject)}\" " +
+                $"boxName=\"{SafeLog(mail.MailVM?.BoxName)}\" " +
+                $"isHtml={mail.MailVM?.IsBodyHtml} " +
+
+                $"externalUser={SafeLog(mail.ExternalMailAddress)} " +
+                $"externalSmtp={SafeLog(mail.ExternalSmpt)} " +
+                $"externalPort={mail.ExternalPort} " +
+                $"externalSsl={mail.ExternalSsl} " +
+                $"externalKey={MaskSecret(mail.ExternalConnectionKey)} " +
+
+                $"internalUser={SafeLog(mail.InternalMailAddress)} " +
+                $"internalSmtp={SafeLog(mail.InternalSmpt)} " +
+                $"internalPort={mail.InternalPort} " +
+                $"internalSsl={mail.InternalSsl} " +
+                $"internalKey={MaskSecret(mail.InternalConnectionKey)} " +
+
+                $"fileCount={mail.fileByteArrays?.Count ?? 0}"
+            );
+        }
+
+        private static void LogMailMq(string tag, MessageMQMailMultiple mail)
+        {
+            var toList = "";
+
+            if (mail.MailMultiVM?.ToMultipleBoxAdress != null)
+            {
+                toList = string.Join(
+                    ",",
+                    mail.MailMultiVM.ToMultipleBoxAdress.Select(x => $"{x.Item1}<{x.Item2}>")
+                );
+            }
+
+            Console.WriteLine(
+                $"[{tag}] " +
+                $"mailId={mail.MailMultiVM?.MailId} " +
+                $"toCount={mail.MailMultiVM?.ToMultipleBoxAdress?.Count ?? 0} " +
+                $"toList={SafeLog(toList, 400)} " +
+                $"subject=\"{SafeLog(mail.MailMultiVM?.Subject)}\" " +
+                $"boxName=\"{SafeLog(mail.MailMultiVM?.BoxName)}\" " +
+                $"isHtml={mail.MailMultiVM?.IsBodyHtml} " +
+
+                $"externalUser={SafeLog(mail.ExternalMailAddress)} " +
+                $"externalSmtp={SafeLog(mail.ExternalSmpt)} " +
+                $"externalPort={mail.ExternalPort} " +
+                $"externalSsl={mail.ExternalSsl} " +
+                $"externalKey={MaskSecret(mail.ExternalConnectionKey)} " +
+
+                $"internalUser={SafeLog(mail.InternalMailAddress)} " +
+                $"internalSmtp={SafeLog(mail.InternalSmpt)} " +
+                $"internalPort={mail.InternalPort} " +
+                $"internalSsl={mail.InternalSsl} " +
+                $"internalKey={MaskSecret(mail.InternalConnectionKey)} " +
+
+                $"fileCount={mail.fileByteArrays?.Count ?? 0}"
+            );
+        }
+
+        // -------------------------
+        // Attachment helpers
+        // -------------------------
         private static void AddAttachmentsFromMailVm(BodyBuilder bodyBuilder, IList<IFormFile>? files)
         {
             if (files == null || files.Count == 0)
@@ -482,29 +538,16 @@ namespace MailConsumerRabbitMQ.Modals
             }
         }
 
+        // -------------------------
+        // SendEmail single
+        // -------------------------
         private async Task SendEmail(MessageMQMail _mail)
         {
-            if (_mail.MailVM == null)
-                throw new InvalidOperationException("MailVM boş.");
-
-            if (string.IsNullOrWhiteSpace(_mail.MailVM.To))
-                throw new InvalidOperationException("Mail gönderilemedi: MailVM.To boş, alıcı yok.");
-
-            static string OneLine(string? s, int max = 160)
-            {
-                if (string.IsNullOrWhiteSpace(s)) return "";
-                s = s.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
-                if (s.Length > max) s = s.Substring(0, max) + "...";
-                return s;
-            }
-
-            static string Safe(string? s, int max = 120) => OneLine(s, max);
-
             var started = DateTime.Now;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            var to = Safe(_mail.MailVM.To, 200);
-            var subject = Safe(_mail.MailVM.Subject, 200);
+            var to = SafeLog(_mail?.MailVM?.To, 200);
+            var subject = SafeLog(_mail?.MailVM?.Subject, 200);
 
             int attCount = 0;
             long attBytes = 0;
@@ -532,27 +575,34 @@ namespace MailConsumerRabbitMQ.Modals
                 var mimeMessage = new MimeMessage();
 
                 mimeMessage.From.Add(
-                    new MailboxAddress(_mail.ExternalMailAddress, _mail.ExternalMailAddress));
-
-                var toName = string.IsNullOrWhiteSpace(_mail.MailVM.BoxName)
-                    ? _mail.MailVM.To
-                    : _mail.MailVM.BoxName;
+                    new MailboxAddress(_mail.ExternalMailAddress, _mail.ExternalMailAddress)
+                );
 
                 mimeMessage.To.Add(
-                    new MailboxAddress(toName, _mail.MailVM.To));
+                    new MailboxAddress(_mail.MailVM.BoxName ?? "user", _mail.MailVM.To)
+                );
+
+                if (!string.IsNullOrWhiteSpace(_mail.MailVM.Cc))
+                    mimeMessage.Cc.Add(MailboxAddress.Parse(_mail.MailVM.Cc));
+
+                if (!string.IsNullOrWhiteSpace(_mail.MailVM.Bcc))
+                    mimeMessage.Bcc.Add(MailboxAddress.Parse(_mail.MailVM.Bcc));
 
                 mimeMessage.Subject = _mail.MailVM.Subject ?? "";
 
-                var bodyBuilder = new BodyBuilder
-                {
-                    HtmlBody = _mail.MailVM.Body ?? ""
-                };
+                var bodyBuilder = new BodyBuilder();
+
+                if (_mail.MailVM.IsBodyHtml)
+                    bodyBuilder.HtmlBody = _mail.MailVM.Body ?? "";
+                else
+                    bodyBuilder.TextBody = _mail.MailVM.Body ?? "";
 
                 FillFilesFromBase64IfAny(_mail);
 
                 if (_mail.MailVM.Files != null)
                 {
                     attCount = _mail.MailVM.Files.Count;
+
                     foreach (var f in _mail.MailVM.Files)
                         attBytes += f?.Length ?? 0;
                 }
@@ -580,7 +630,8 @@ namespace MailConsumerRabbitMQ.Modals
 
                 Console.WriteLine(
                     $"[Success] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"to={to} sub=\"{subject}\" smtp={host} port={port} ssl={ssl} att={attCount} bytes={attBytes}");
+                    $"to={to} sub=\"{subject}\" smtp={host} port={port} ssl={ssl} att={attCount} bytes={attBytes}"
+                );
 
                 sayac++;
             }
@@ -590,43 +641,36 @@ namespace MailConsumerRabbitMQ.Modals
 
                 Console.WriteLine(
                     $"[Fail] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"to={to} sub=\"{subject}\" smtp={_mail.ExternalSmpt} port={_mail.ExternalPort} ssl={_mail.ExternalSsl} " +
-                    $"att={attCount} bytes={attBytes}");
+                    $"to={to} sub=\"{subject}\" smtp={_mail?.ExternalSmpt} port={_mail?.ExternalPort} ssl={_mail?.ExternalSsl} " +
+                    $"att={attCount} bytes={attBytes}"
+                );
 
                 throw;
             }
         }
 
+        // -------------------------
+        // SendEmail multiple
+        // -------------------------
         private async Task SendEmailMultiple(MessageMQMailMultiple _mail)
         {
-            if (_mail.MailMultiVM?.ToMultipleBoxAdress == null ||
-                _mail.MailMultiVM.ToMultipleBoxAdress.Count == 0)
-            {
-                throw new InvalidOperationException("Mail gönderilemedi: ToMultipleBoxAdress boş, alıcı yok.");
-            }
-
-            static string OneLine(string? s, int max = 160)
-            {
-                if (string.IsNullOrWhiteSpace(s)) return "";
-                s = s.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
-                if (s.Length > max) s = s.Substring(0, max) + "...";
-                return s;
-            }
-
-            static string Safe(string? s, int max = 120) => OneLine(s, max);
-
             var started = DateTime.Now;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            var subject = Safe(_mail.MailMultiVM.Subject, 200);
+            var subject = SafeLog(_mail?.MailMultiVM?.Subject, 200);
 
             int attCount = 0;
             long attBytes = 0;
 
-            int toCount = _mail.MailMultiVM.ToMultipleBoxAdress.Count;
+            int toCount = _mail?.MailMultiVM?.ToMultipleBoxAdress?.Count ?? 0;
 
-            string toList = string.Join(",", _mail.MailMultiVM.ToMultipleBoxAdress.Select(x => x.Item2));
-            toList = Safe(toList, 260);
+            string toList = "";
+
+            if (_mail?.MailMultiVM?.ToMultipleBoxAdress != null && _mail.MailMultiVM.ToMultipleBoxAdress.Count > 0)
+            {
+                toList = string.Join(",", _mail.MailMultiVM.ToMultipleBoxAdress.Select(x => x.Item2));
+                toList = SafeLog(toList, 260);
+            }
 
             try
             {
@@ -651,29 +695,40 @@ namespace MailConsumerRabbitMQ.Modals
                 var mimeMessage = new MimeMessage();
 
                 mimeMessage.From.Add(
-                    new MailboxAddress(_mail.ExternalMailAddress, _mail.ExternalMailAddress));
+                    new MailboxAddress(_mail.ExternalMailAddress, _mail.ExternalMailAddress)
+                );
 
                 foreach (var item in _mail.MailMultiVM.ToMultipleBoxAdress)
                 {
-                    if (string.IsNullOrWhiteSpace(item.Item2))
-                        continue;
-
-                    var displayName = string.IsNullOrWhiteSpace(item.Item1)
+                    var name = string.IsNullOrWhiteSpace(item.Item1)
                         ? item.Item2
                         : item.Item1;
 
-                    mimeMessage.To.Add(new MailboxAddress(displayName, item.Item2));
+                    var address = item.Item2;
+
+                    if (string.IsNullOrWhiteSpace(address))
+                        continue;
+
+                    mimeMessage.To.Add(new MailboxAddress(name, address));
                 }
 
                 if (mimeMessage.To.Count == 0)
-                    throw new InvalidOperationException("Mail gönderilemedi: MimeMessage.To boş kaldı.");
+                    throw new InvalidOperationException("Geçerli alıcı adresi bulunamadı.");
+
+                if (!string.IsNullOrWhiteSpace(_mail.MailMultiVM.Cc))
+                    mimeMessage.Cc.Add(MailboxAddress.Parse(_mail.MailMultiVM.Cc));
+
+                if (!string.IsNullOrWhiteSpace(_mail.MailMultiVM.Bcc))
+                    mimeMessage.Bcc.Add(MailboxAddress.Parse(_mail.MailMultiVM.Bcc));
 
                 mimeMessage.Subject = _mail.MailMultiVM.Subject ?? "";
 
-                var bodyBuilder = new BodyBuilder
-                {
-                    HtmlBody = _mail.MailMultiVM.Body ?? ""
-                };
+                var bodyBuilder = new BodyBuilder();
+
+                if (_mail.MailMultiVM.IsBodyHtml)
+                    bodyBuilder.HtmlBody = _mail.MailMultiVM.Body ?? "";
+                else
+                    bodyBuilder.TextBody = _mail.MailMultiVM.Body ?? "";
 
                 FillFilesFromBase64IfAny(_mail);
 
@@ -685,13 +740,15 @@ namespace MailConsumerRabbitMQ.Modals
                 if (_mail.MailVM?.Files != null)
                 {
                     attCount += _mail.MailVM.Files.Count;
+
                     foreach (var f in _mail.MailVM.Files)
                         attBytes += f?.Length ?? 0;
                 }
 
-                if (_mail.MailMultiVM.Files != null)
+                if (_mail.MailMultiVM?.Files != null)
                 {
                     attCount += _mail.MailMultiVM.Files.Count;
+
                     foreach (var f in _mail.MailMultiVM.Files)
                         attBytes += f?.Length ?? 0;
                 }
@@ -717,7 +774,8 @@ namespace MailConsumerRabbitMQ.Modals
 
                 Console.WriteLine(
                     $"[Success] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={host} port={port} ssl={ssl} att={attCount} bytes={attBytes}");
+                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={host} port={port} ssl={ssl} att={attCount} bytes={attBytes}"
+                );
 
                 sayac++;
             }
@@ -727,8 +785,9 @@ namespace MailConsumerRabbitMQ.Modals
 
                 Console.WriteLine(
                     $"[Fail] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={_mail.ExternalSmpt} port={_mail.ExternalPort} ssl={_mail.ExternalSsl} " +
-                    $"att={attCount} bytes={attBytes}");
+                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={_mail?.ExternalSmpt} port={_mail?.ExternalPort} ssl={_mail?.ExternalSsl} " +
+                    $"att={attCount} bytes={attBytes}"
+                );
 
                 throw;
             }
