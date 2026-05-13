@@ -129,6 +129,7 @@ namespace MailConsumerRabbitMQ.Modals
 
                     if (mailSingle != null && mailSingle.MailVM != null)
                     {
+                        LogMailMq("SINGLE-RECEIVED", mailSingle);
                         await SendEmail(mailSingle);
                     }
                     else
@@ -138,6 +139,10 @@ namespace MailConsumerRabbitMQ.Modals
                         if (mailMultiple == null)
                             throw new InvalidOperationException("MQ message parse edildi ama null döndü.");
 
+                        if (mailMultiple == null || mailMultiple.MailMultiVM == null)
+                            throw new InvalidOperationException("MQ message parse edildi ama MailVM / MailMultiVM bulunamadı.");
+
+                        LogMailMq("MULTI-RECEIVED", mailMultiple);
                         await SendEmailMultiple(mailMultiple);
                     }
 
@@ -145,8 +150,6 @@ namespace MailConsumerRabbitMQ.Modals
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Mail gönderme hatası: {ex.Message}");
-
                     var retryCount = ReadRetryCount(ea.BasicProperties?.Headers);
 
                     if (HelperGmail.IsGmailAuthBlocked(ex) || IsCircuitBreakException(ex))
@@ -162,10 +165,10 @@ namespace MailConsumerRabbitMQ.Modals
                         Console.WriteLine($"[Retry] retryCount={retryCount} targetQueue={targetQueue}");
 
                         await PublishWithRetryHeaderAsync(
-                            routingKey: targetQueue,
+                            routingKey: Q_RETRY_5M,
                             body: ea.Body,
                             originalProps: ea.BasicProperties,
-                            retryCount: retryCount + 1);
+                            retryCount: 1);
 
                         await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                         return;
@@ -183,7 +186,7 @@ namespace MailConsumerRabbitMQ.Modals
                 }
             };
 
-            _channel.BasicConsumeAsync(
+            _ = _channel.BasicConsumeAsync(
                 queue: Q_MAIN,
                 autoAck: false,
                 consumer: consumer);
@@ -219,7 +222,7 @@ namespace MailConsumerRabbitMQ.Modals
         private static string SessionKey(string host, int port, string user)
             => $"{host}:{port}:{user}".ToLowerInvariant();
 
-        private static SecureSocketOptions ResolveSocketOptions(string host, int port, bool externalSslFlag)
+        private static SecureSocketOptions ResolveSocketOptions(string host, int port, bool sslFlag)
         {
             if (port == 465) return SecureSocketOptions.SslOnConnect;
             if (port == 587) return SecureSocketOptions.StartTls;
@@ -336,8 +339,11 @@ namespace MailConsumerRabbitMQ.Modals
 
         private static int ReadRetryCount(IDictionary<string, object>? headers)
         {
-            if (headers == null) return 0;
-            if (!headers.TryGetValue("x-retry", out var v)) return 0;
+            if (headers == null)
+                return 0;
+
+            if (!headers.TryGetValue("x-retry", out var v))
+                return 0;
 
             try
             {
@@ -380,6 +386,7 @@ namespace MailConsumerRabbitMQ.Modals
             }
 
             headers["x-retry"] = Encoding.UTF8.GetBytes(retryCount.ToString());
+
             props.Headers = headers;
 
             await _channel.BasicPublishAsync(
@@ -392,28 +399,41 @@ namespace MailConsumerRabbitMQ.Modals
 
         private static void AddAttachmentsFromMailVm(BodyBuilder bodyBuilder, IList<IFormFile>? files)
         {
-            if (files == null || files.Count == 0) return;
+            if (files == null || files.Count == 0)
+                return;
 
             foreach (var file in files)
             {
-                if (file == null || file.Length <= 0) continue;
+                if (file == null || file.Length <= 0)
+                    continue;
 
                 using var ms = new MemoryStream();
                 file.CopyTo(ms);
+
                 bodyBuilder.Attachments.Add(file.FileName, ms.ToArray());
             }
         }
 
         private static void FillFilesFromBase64IfAny(MessageMQMail mail)
         {
-            if (mail.fileByteArrays == null || mail.fileByteArrays.Count == 0) return;
+            if (mail.fileByteArrays == null || mail.fileByteArrays.Count == 0)
+                return;
+
+            if (mail.MailVM == null)
+                mail.MailVM = new MailVM();
 
             mail.MailVM.Files = new List<IFormFile>();
 
             for (int i = 0; i < mail.fileByteArrays.Count; i++)
             {
                 var base64File = mail.fileByteArrays[i];
-                var fileFullName = mail.fileFullName[i];
+
+                if (string.IsNullOrWhiteSpace(base64File))
+                    continue;
+
+                var fileFullName = mail.fileFullName != null && mail.fileFullName.Count > i
+                    ? mail.fileFullName[i]
+                    : $"attachment_{i + 1}";
 
                 var fileBytes = Convert.FromBase64String(base64File);
                 var stream = new MemoryStream(fileBytes);
@@ -430,7 +450,8 @@ namespace MailConsumerRabbitMQ.Modals
 
         private static void FillFilesFromBase64IfAny(MessageMQMailMultiple mail)
         {
-            if (mail.fileByteArrays == null || mail.fileByteArrays.Count == 0) return;
+            if (mail.fileByteArrays == null || mail.fileByteArrays.Count == 0)
+                return;
 
             if (mail.MailVM == null)
                 mail.MailVM = new MailVM();
@@ -440,7 +461,13 @@ namespace MailConsumerRabbitMQ.Modals
             for (int i = 0; i < mail.fileByteArrays.Count; i++)
             {
                 var base64File = mail.fileByteArrays[i];
-                var fileFullName = mail.fileFullName[i];
+
+                if (string.IsNullOrWhiteSpace(base64File))
+                    continue;
+
+                var fileFullName = mail.fileFullName != null && mail.fileFullName.Count > i
+                    ? mail.fileFullName[i]
+                    : $"attachment_{i + 1}";
 
                 var fileBytes = Convert.FromBase64String(base64File);
                 var stream = new MemoryStream(fileBytes);
@@ -484,6 +511,24 @@ namespace MailConsumerRabbitMQ.Modals
 
             try
             {
+                if (_mail == null)
+                    throw new ArgumentNullException(nameof(_mail));
+
+                if (_mail.MailVM == null)
+                    throw new InvalidOperationException("MailVM null geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.MailVM.To))
+                    throw new InvalidOperationException("MailVM.To boş geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.ExternalMailAddress))
+                    throw new InvalidOperationException("ExternalMailAddress boş geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.ExternalConnectionKey))
+                    throw new InvalidOperationException("ExternalConnectionKey boş geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.ExternalSmpt))
+                    throw new InvalidOperationException("ExternalSmpt boş geldi.");
+
                 var mimeMessage = new MimeMessage();
 
                 mimeMessage.From.Add(
@@ -585,6 +630,24 @@ namespace MailConsumerRabbitMQ.Modals
 
             try
             {
+                if (_mail == null)
+                    throw new ArgumentNullException(nameof(_mail));
+
+                if (_mail.MailMultiVM == null)
+                    throw new InvalidOperationException("MailMultiVM null geldi.");
+
+                if (_mail.MailMultiVM.ToMultipleBoxAdress == null || _mail.MailMultiVM.ToMultipleBoxAdress.Count == 0)
+                    throw new InvalidOperationException("ToMultipleBoxAdress boş geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.ExternalMailAddress))
+                    throw new InvalidOperationException("ExternalMailAddress boş geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.ExternalConnectionKey))
+                    throw new InvalidOperationException("ExternalConnectionKey boş geldi.");
+
+                if (string.IsNullOrWhiteSpace(_mail.ExternalSmpt))
+                    throw new InvalidOperationException("ExternalSmpt boş geldi.");
+
                 var mimeMessage = new MimeMessage();
 
                 mimeMessage.From.Add(
