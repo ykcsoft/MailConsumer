@@ -12,7 +12,7 @@ RUN dotnet restore
 COPY . ./
 RUN dotnet publish -c Release -o /out
 
-# Çalýþtýrma için temel imaj olarak .NET Runtime kullan
+# Çalýþtýrma için temel imaj olarak .NET Runtime kullans
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 
 # Çalýþma dizinini ayarlan

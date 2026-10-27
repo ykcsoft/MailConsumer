@@ -11,7 +11,7 @@ namespace MailConsumerRabbitMQ.Modals
     {//
         public Guid MailId { get; set; }
         /// <summary>
-        /// Gets or Sets the subject.
+        /// Gets or Sets the subjects.
         /// </summary>
         /// <value>A string.</value>
         public string Subject { get; set; }
@@ -51,5 +51,14 @@ namespace MailConsumerRabbitMQ.Modals
         /// </summary>
         public string BoxName { get; set; } = "user";
         public Guid ProductId { get; set; }
+    }
+    public class MailVmMultiple : MailVM
+    {
+        /// <summary>
+        /// Gets or Sets the to multiple.
+        /// </summary>
+        /// <value>A list of strings.</value>
+        public List<string> ToMultiple { get; set; }
+        public List<(string, string)> ToMultipleBoxAdress { get; set; }
     }
 }
