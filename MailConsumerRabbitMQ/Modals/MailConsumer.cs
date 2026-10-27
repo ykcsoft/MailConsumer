@@ -34,9 +34,9 @@ namespace MailConsumerRabbitMQ.Modals
             _factory = new ConnectionFactory
             {
                 Port = 5672,
-                HostName = "c_rabbitmq",
-                UserName = "user",
-                Password = "1234567",
+                HostName = "rabbitmq",
+                UserName = "recruiter",
+                Password = "ykcsft1155+++",
             };
 
             _connection = await _factory.CreateConnectionAsync();
